@@ -1,0 +1,135 @@
+name: Go CI
+
+# Reusable CI for Go modules: vet, test (optionally with -race) and build on an
+# OS matrix, plus a single ubuntu job for gofmt and golangci-lint.
+#
+# Third-party actions are pinned to full commit SHAs rather than tags: tags are
+# mutable, so a repointed tag would silently change what runs here.
+
+on:
+  workflow_call:
+    inputs:
+      go-version-file:
+        description: Path to the file setup-go reads the Go version from.
+        type: string
+        default: go.mod
+      os:
+        description: JSON array of runner labels for the test matrix.
+        type: string
+        default: '["ubuntu-latest", "macos-latest", "windows-latest"]'
+      race:
+        description: Run `go test` with -race.
+        type: boolean
+        default: true
+      gofmt:
+        description: Fail if `gofmt -l .` lists any file.
+        type: boolean
+        default: true
+      lint:
+        description: >-
+          Run golangci-lint: "true", "false", or "auto" (run only when a
+          .golangci.yml / .golangci.yaml exists in the repository).
+        type: string
+        default: auto
+      golangci-lint-version:
+        description: golangci-lint release to run. Pinned so a new release cannot turn a green PR red on its own.
+        type: string
+        default: v2.13.2
+      configure-git:
+        description: Give git a throwaway identity on the runner, for test suites that create commits.
+        type: boolean
+        default: false
+      timeout-minutes:
+        description: Timeout for each test job.
+        type: number
+        default: 15
+
+permissions:
+  contents: read
+
+concurrency:
+  group: go-ci-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(inputs.os) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: ${{ inputs.go-version-file }}
+          cache: true
+
+      - name: Configure git
+        if: inputs.configure-git
+        shell: bash
+        run: |
+          git config --global user.email "ci@example.com"
+          git config --global user.name "CI"
+          git config --global init.defaultBranch main
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        shell: bash
+        env:
+          RACE: ${{ inputs.race }}
+        run: |
+          set -euo pipefail
+          if [ "$RACE" = "true" ]; then
+            go test -race ./...
+          else
+            go test ./...
+          fi
+
+      - name: Build
+        run: go build ./...
+
+  # ubuntu only: gofmt and golangci-lint read the same source on every
+  # platform, so running them per OS would only cost minutes.
+  lint:
+    if: inputs.gofmt || inputs.lint != 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: ${{ inputs.go-version-file }}
+          cache: true
+
+      # `gofmt -l` exits 0 even when it lists files, so the list is the gate.
+      - name: Format check
+        if: inputs.gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Lint
+        if: inputs.lint == 'true' || (inputs.lint == 'auto' && hashFiles('.golangci.yml', '.golangci.yaml') != '')
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: ${{ inputs.golangci-lint-version }}

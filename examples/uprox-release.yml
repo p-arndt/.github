@@ -1,0 +1,23 @@
+# .github/workflows/release.yml in p-arndt/uprox
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  # Nothing gets published from a commit that fails the regular CI suite.
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: ci
+    uses: p-arndt/.github/.github/workflows/container-release.yml@v1
+    permissions:
+      contents: write
+      packages: write
+    with:
+      cache: registry

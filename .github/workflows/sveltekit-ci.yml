@@ -1,0 +1,153 @@
+name: SvelteKit CI
+
+# Reusable CI for pnpm-based SvelteKit apps: install from the lockfile, then
+# svelte-check, lint, unit tests and build, each toggleable.
+#
+# pnpm's version comes from the `packageManager` field in package.json (that is
+# what pnpm/action-setup reads when no version is given), so CI and local
+# installs never disagree.
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: Node.js version for actions/setup-node.
+        type: string
+        default: '24'
+      working-directory:
+        description: Directory containing package.json.
+        type: string
+        default: .
+      env:
+        description: >-
+          Newline-separated KEY=VALUE pairs exported before any step, e.g.
+          build-time placeholders for env vars that SvelteKit validates on
+          import. Not for secrets: the values end up in the workflow file.
+        type: string
+        default: ''
+      setup-command:
+        description: Extra command run right after install (e.g. code generation like a Paraglide compile).
+        type: string
+        default: ''
+      check:
+        description: Run check-command (svelte-check).
+        type: boolean
+        default: true
+      check-command:
+        description: Command for the type check.
+        type: string
+        default: pnpm check
+      lint:
+        description: Run lint-command.
+        type: boolean
+        default: true
+      lint-command:
+        description: Command for linting.
+        type: string
+        default: pnpm lint
+      test:
+        description: Run test-command.
+        type: boolean
+        default: true
+      test-command:
+        description: Command for the unit tests (must not start a watcher).
+        type: string
+        default: pnpm test:unit --run
+      build:
+        description: Run build-command.
+        type: boolean
+        default: false
+      build-command:
+        description: Command for the production build.
+        type: string
+        default: pnpm build
+      timeout-minutes:
+        description: Job timeout.
+        type: number
+        default: 20
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sveltekit-ci-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.working-directory }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Export environment
+        if: inputs.env != ''
+        env:
+          VARS: ${{ inputs.env }}
+        run: |
+          set -euo pipefail
+          while IFS= read -r line; do
+            line="${line#"${line%%[![:space:]]*}"}"
+            [ -z "$line" ] && continue
+            case "$line" in \#*) continue ;; esac
+            if ! [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]]; then
+              echo "::error::env line is not KEY=VALUE: '${line%%=*}'" >&2
+              exit 1
+            fi
+            echo "$line" >> "$GITHUB_ENV"
+          done <<< "$VARS"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          package_json_file: ${{ inputs.working-directory }}/package.json
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: pnpm
+          cache-dependency-path: ${{ inputs.working-directory }}/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Commands come from the caller's workflow file, which is as trusted as
+      # this one; they reach the shell through env, not ${{ }} interpolation.
+      - name: Setup command
+        if: inputs.setup-command != ''
+        env:
+          CMD: ${{ inputs.setup-command }}
+        run: eval "$CMD"
+
+      - name: Type check
+        if: inputs.check
+        env:
+          CMD: ${{ inputs.check-command }}
+        run: eval "$CMD"
+
+      - name: Lint
+        if: inputs.lint
+        env:
+          CMD: ${{ inputs.lint-command }}
+        run: eval "$CMD"
+
+      - name: Unit tests
+        if: inputs.test
+        env:
+          CMD: ${{ inputs.test-command }}
+        run: eval "$CMD"
+
+      - name: Build
+        if: inputs.build
+        env:
+          CMD: ${{ inputs.build-command }}
+        run: eval "$CMD"

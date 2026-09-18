@@ -1,0 +1,242 @@
+name: Container release
+
+# Reusable release pipeline for a single container image, driven by a tag push
+# only (based on orbit and uprox):
+#
+#   verify  -> the tag agrees with the committed version (stamp verify)
+#   image   -> buildx build + push to GHCR, tagged <version>, <major>.<minor>
+#              and latest (the last two only for non-prereleases)
+#   release -> GitHub Release with notes from the annotated tag or git-cliff
+#
+# Gate on the repository's own CI by calling it as a job in the caller and
+# adding it to `needs:` of the job that calls this workflow.
+#
+# Third-party actions are pinned to full commit SHAs, not tags: the image job
+# can push packages and the release job can write contents.
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: Image name under ghcr.io/<owner>/. Defaults to the repository name.
+        type: string
+        default: ''
+      context:
+        description: Build context.
+        type: string
+        default: .
+      dockerfile:
+        description: Dockerfile path.
+        type: string
+        default: Dockerfile
+      target:
+        description: Dockerfile stage to build. Empty builds the last stage.
+        type: string
+        default: ''
+      platforms:
+        description: Comma-separated platforms. Add linux/arm64 the day a host needs it; QEMU makes it slow.
+        type: string
+        default: linux/amd64
+      build-args:
+        description: Extra newline-separated build args. VERSION=<version> is always passed.
+        type: string
+        default: ''
+      cache:
+        description: 'Build cache: "gha" (GitHub Actions cache), "registry" (inline cache on :latest) or "none".'
+        type: string
+        default: gha
+      verify-tag:
+        description: Check the tag against the committed version with the stamp action.
+        type: boolean
+        default: true
+      changelog:
+        description: 'Release notes source: "stamp" (annotated tag message), "git-cliff" or "none" (no GitHub Release).'
+        type: string
+        default: stamp
+      cliff-config:
+        description: git-cliff config path (changelog = git-cliff only).
+        type: string
+        default: cliff.toml
+    outputs:
+      version:
+        description: The released version, without a leading "v".
+        value: ${{ jobs.verify.outputs.version }}
+      image:
+        description: Fully qualified image name without tag.
+        value: ${{ jobs.image.outputs.image }}
+      digest:
+        description: Digest of the pushed image.
+        value: ${{ jobs.image.outputs.digest }}
+
+permissions:
+  contents: read
+
+# Two runs pushing the same tags would race; queue them, never cancel one.
+concurrency:
+  group: container-release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+
+    steps:
+      - name: Require a tag push
+        if: github.ref_type != 'tag'
+        run: |
+          echo "::error::this workflow publishes the pushed tag; it was triggered by a ${GITHUB_REF_TYPE:-non-tag} ref" >&2
+          exit 1
+
+      - name: Checkout
+        if: inputs.verify-tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Verify the tag against the committed version
+        if: inputs.verify-tag
+        uses: p-arndt/stamp@97cdab09cbe2846f516f74b09a71034c09addce0 # v0.4.1
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if ! [[ "$version" =~ ^[0-9][0-9A-Za-z.+-]{0,63}$ ]]; then
+            echo "::error::version '$version' is not a valid release version" >&2
+            exit 1
+          fi
+          if [[ "$version" == *-* ]]; then prerelease=true; else prerelease=false; fi
+          echo "version=$version"       >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+
+  image:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.name.outputs.image }}
+      digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # GHCR wants lowercase names; owners and repositories may not be.
+      - name: Resolve image name and cache settings
+        id: name
+        shell: bash
+        env:
+          IMAGE: ${{ inputs.image }}
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          CACHE: ${{ inputs.cache }}
+        run: |
+          set -euo pipefail
+          name="${IMAGE:-$REPO}"
+          image="ghcr.io/${OWNER,,}/${name,,}"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          case "$CACHE" in
+            gha)      from="type=gha";                        to="type=gha,mode=max" ;;
+            registry) from="type=registry,ref=${image}:latest"; to="type=inline" ;;
+            none)     from="";                                to="" ;;
+            *) echo "::error::cache must be gha, registry or none, got '$CACHE'" >&2; exit 1 ;;
+          esac
+          echo "cache-from=$from" >> "$GITHUB_OUTPUT"
+          echo "cache-to=$to"     >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU (for non-native platforms)
+        if: inputs.platforms != 'linux/amd64'
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # semver patterns skip {{major}}.{{minor}} for pre-releases, and
+      # latest=auto only moves `latest` for a non-prerelease semver tag, so a
+      # beta never replaces what `docker pull <image>` resolves to.
+      - name: Image tags and labels
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ steps.name.outputs.image }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+          flavor: |
+            latest=auto
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        env:
+          # No build-record artifacts: nothing downstream consumes them.
+          DOCKER_BUILD_RECORD_UPLOAD: false
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          target: ${{ inputs.target }}
+          platforms: ${{ inputs.platforms }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ needs.verify.outputs.version }}
+            ${{ inputs.build-args }}
+          cache-from: ${{ steps.name.outputs.cache-from }}
+          cache-to: ${{ steps.name.outputs.cache-to }}
+
+  release:
+    needs: [verify, image]
+    if: inputs.changelog != 'none'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      # `stamp release` writes the notes into the annotated tag; this reads them back.
+      - name: Read release notes from the tag
+        id: stamp
+        if: inputs.changelog == 'stamp'
+        uses: p-arndt/stamp@97cdab09cbe2846f516f74b09a71034c09addce0 # v0.4.1
+
+      - name: Generate changelog
+        if: inputs.changelog == 'git-cliff'
+        uses: orhun/git-cliff-action@f50e11560dce63f7c33227798f90b924471a88b5 # v4.8.0
+        with:
+          config: ${{ inputs.cliff-config }}
+          args: --latest --strip all
+        env:
+          # Relative: Docker action, only the workspace is mounted.
+          OUTPUT: CHANGELOG_BODY.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          tag_name: ${{ github.ref_name }}
+          body_path: ${{ steps.stamp.outputs.notes-file || 'CHANGELOG_BODY.md' }}
+          prerelease: ${{ needs.verify.outputs.prerelease }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,17 @@
+# .github/workflows/release.yml in p-arndt/hop
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  release:
+    uses: p-arndt/.github/.github/workflows/go-release.yml@v1
+    # A called workflow gets at most what its caller grants.
+    permissions:
+      contents: write
+    with:
+      binary: hop
+      test-os: '["ubuntu-latest", "macos-latest", "windows-latest"]'
+      changelog: git-cliff

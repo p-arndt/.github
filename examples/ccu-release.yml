@@ -1,0 +1,21 @@
+# .github/workflows/release.yml in p-arndt/compose-check-updates
+# Raw binaries (the README's install one-liners download them by name), nine
+# targets, notes from the annotated tag written by `stamp release`.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  release:
+    uses: p-arndt/.github/.github/workflows/go-release.yml@v1
+    permissions:
+      contents: write
+    with:
+      binary: ccu
+      artifact-style: raw
+      targets: >-
+        ["linux/amd64", "linux/arm", "linux/arm64", "linux/386",
+         "windows/amd64", "windows/arm64", "windows/386",
+         "darwin/amd64", "darwin/arm64"]

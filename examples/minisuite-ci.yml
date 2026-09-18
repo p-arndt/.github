@@ -1,0 +1,16 @@
+# .github/workflows/ci.yml in p-arndt/minisuite
+# The smoke, interop and docker jobs are project specific and stay as local
+# jobs next to this one.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    uses: p-arndt/.github/.github/workflows/rust-ci.yml@v1

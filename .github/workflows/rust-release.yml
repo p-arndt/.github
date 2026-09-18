@@ -1,0 +1,355 @@
+name: Rust release
+
+# Reusable release pipeline for Cargo projects, driven by a tag push only (based
+# on minisuite). The version is decided before the tag exists (`stamp release`
+# stamps Cargo.toml, refreshes Cargo.lock, commits, tags and pushes):
+#
+#   verify  -> the tag agrees with the committed version (stamp verify)
+#   build   -> one archive per target containing every listed binary
+#   image   -> (optional) multi-arch images to GHCR, one per Dockerfile target
+#   release -> sha256 checksums + GitHub Release with the notes
+#
+# Third-party actions are pinned to full commit SHAs, not tags: tags are
+# mutable, and these jobs hold tokens that publish releases and images.
+
+on:
+  workflow_call:
+    inputs:
+      name:
+        description: Archive name prefix, e.g. "minisuite" -> minisuite-<version>-<target>.tar.gz.
+        type: string
+        required: true
+      binaries:
+        description: Space-separated binary names (without .exe) packed into every archive.
+        type: string
+        required: true
+      targets:
+        description: 'JSON array of {"os": <runner>, "target": <rust triple>} objects.'
+        type: string
+        default: >-
+          [
+            {"os": "ubuntu-latest",  "target": "x86_64-unknown-linux-musl"},
+            {"os": "ubuntu-latest",  "target": "aarch64-unknown-linux-musl"},
+            {"os": "windows-latest", "target": "x86_64-pc-windows-msvc"},
+            {"os": "macos-latest",   "target": "aarch64-apple-darwin"},
+            {"os": "macos-latest",   "target": "x86_64-apple-darwin"}
+          ]
+      extra-files:
+        description: Space-separated files added to every archive when they exist (missing ones are skipped).
+        type: string
+        default: README.md LICENSE
+      cargo-args:
+        description: Arguments passed to `cargo build --release --target <t>`.
+        type: string
+        default: --workspace --locked
+      toolchain:
+        description: Rust toolchain to install.
+        type: string
+        default: stable
+      verify-tag:
+        description: Check the tag against the committed version with the stamp action.
+        type: boolean
+        default: true
+      changelog:
+        description: 'Release notes source: "stamp" (annotated tag message) or "git-cliff".'
+        type: string
+        default: stamp
+      cliff-config:
+        description: git-cliff config path (changelog = git-cliff only).
+        type: string
+        default: cliff.toml
+      images:
+        description: >-
+          JSON array of Dockerfile targets to publish as ghcr.io/<owner>/<target>.
+          Empty ("[]") skips the image job.
+        type: string
+        default: '[]'
+      image-platforms:
+        description: Platforms for the images.
+        type: string
+        default: linux/amd64,linux/arm64
+      dockerfile:
+        description: Dockerfile path for the images.
+        type: string
+        default: Dockerfile
+    outputs:
+      version:
+        description: The released version, without a leading "v".
+        value: ${{ jobs.verify.outputs.version }}
+
+permissions:
+  contents: read
+
+# Queue, never cancel: a half-cancelled release could leave partial assets.
+concurrency:
+  group: rust-release-${{ github.repository }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+
+    steps:
+      - name: Require a tag push
+        if: github.ref_type != 'tag'
+        run: |
+          echo "::error::this workflow publishes the pushed tag; it was triggered by a ${GITHUB_REF_TYPE:-non-tag} ref" >&2
+          exit 1
+
+      - name: Checkout
+        if: inputs.verify-tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Verify the tag against the committed version
+        if: inputs.verify-tag
+        uses: p-arndt/stamp@97cdab09cbe2846f516f74b09a71034c09addce0 # v0.4.1
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if ! [[ "$version" =~ ^[0-9][0-9A-Za-z.+-]{0,63}$ ]]; then
+            echo "::error::version '$version' is not a valid release version" >&2
+            exit 1
+          fi
+          if [[ "$version" == *-* ]]; then prerelease=true; else prerelease=false; fi
+          echo "version=$version"       >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(inputs.targets) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install toolchain
+        shell: bash
+        env:
+          TOOLCHAIN: ${{ inputs.toolchain }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$TOOLCHAIN" --profile minimal --target "$TARGET" --no-self-update
+          rustup default "$TOOLCHAIN"
+
+      - name: Cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # Cross-link aarch64 with rust's bundled lld instead of a cross gcc. Only
+      # enough for crates without C code; others need a cross toolchain.
+      - name: Use rust-lld for the aarch64 musl cross build
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_RUSTFLAGS=-C linker=rust-lld" >> "$GITHUB_ENV"
+
+      # Static MSVC runtime -> self-contained .exe files, no vcruntime DLL.
+      - name: Set Windows static CRT
+        if: runner.os == 'Windows'
+        shell: bash
+        run: echo "RUSTFLAGS=-C target-feature=+crt-static" >> "$GITHUB_ENV"
+
+      - name: Build
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          ARGS: ${{ inputs.cargo-args }}
+        run: |
+          # shellcheck disable=SC2086 # ARGS is a list of flags on purpose
+          cargo build --release --target "$TARGET" $ARGS
+
+      - name: Stage artifact (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          NAME: ${{ inputs.name }}
+          VERSION: ${{ needs.verify.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          BINARIES: ${{ inputs.binaries }}
+          EXTRA_FILES: ${{ inputs.extra-files }}
+        run: |
+          set -euo pipefail
+          dir="${NAME}-${VERSION}-${TARGET}"
+          mkdir -p "dist/$dir"
+          for bin in $BINARIES; do cp "target/${TARGET}/release/$bin" "dist/$dir/"; done
+          for f in $EXTRA_FILES; do [ -f "$f" ] && cp "$f" "dist/$dir/" || true; done
+          tar -C dist -czf "dist/${dir}.tar.gz" "$dir"
+          ls -l dist
+
+      - name: Stage artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          NAME: ${{ inputs.name }}
+          VERSION: ${{ needs.verify.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          BINARIES: ${{ inputs.binaries }}
+          EXTRA_FILES: ${{ inputs.extra-files }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = "$env:NAME-$env:VERSION-$env:TARGET"
+          New-Item -ItemType Directory -Force -Path "dist/$dir" | Out-Null
+          foreach ($bin in ($env:BINARIES -split '\s+' | Where-Object { $_ })) {
+            Copy-Item "target/$env:TARGET/release/$bin.exe" "dist/$dir/"
+          }
+          foreach ($f in ($env:EXTRA_FILES -split '\s+' | Where-Object { $_ })) {
+            if (Test-Path $f) { Copy-Item $f "dist/$dir/" }
+          }
+          Compress-Archive -Path "dist/$dir/*" -DestinationPath "dist/$dir.zip" -Force
+          Get-ChildItem dist
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  image:
+    needs: verify
+    if: inputs.images != '[]' && inputs.images != ''
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJSON(inputs.images) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up QEMU (for non-native platforms)
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Only a real release moves `latest`; pre-releases get their version tag.
+      - name: Compute image tags
+        id: tags
+        shell: bash
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          PRERELEASE: ${{ needs.verify.outputs.prerelease }}
+          IMAGE: ${{ matrix.image }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          repo="ghcr.io/${OWNER,,}/${IMAGE}"
+          tags="${repo}:${VERSION}"
+          if [ "$PRERELEASE" != "true" ]; then tags="${tags},${repo}:latest"; fi
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        env:
+          # No build-record artifacts: nothing downstream consumes them, and
+          # they would race the release job's artifact download.
+          DOCKER_BUILD_RECORD_UPLOAD: false
+        with:
+          context: .
+          file: ${{ inputs.dockerfile }}
+          target: ${{ matrix.image }}
+          platforms: ${{ inputs.image-platforms }}
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          build-args: VERSION=${{ needs.verify.outputs.version }}
+          cache-from: type=gha,scope=${{ matrix.image }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image }}
+
+  release:
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      # Only the archives: a broad download could race other uploads.
+      - name: Download build archives
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: artifacts
+          pattern: dist-*
+
+      - name: Collect release files and checksums
+        shell: bash
+        env:
+          NAME: ${{ inputs.name }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist-release
+          find artifacts -type f \( -name '*.tar.gz' -o -name '*.zip' \) -exec cp {} dist-release/ \;
+          (cd dist-release && sha256sum -- * > "${NAME}-${VERSION}-checksums.txt")
+          ls -l dist-release
+
+      - name: Read release notes from the tag
+        id: stamp
+        if: inputs.changelog == 'stamp'
+        uses: p-arndt/stamp@97cdab09cbe2846f516f74b09a71034c09addce0 # v0.4.1
+
+      - name: Generate changelog
+        if: inputs.changelog == 'git-cliff'
+        uses: orhun/git-cliff-action@f50e11560dce63f7c33227798f90b924471a88b5 # v4.8.0
+        with:
+          config: ${{ inputs.cliff-config }}
+          args: --latest --strip all
+        env:
+          # Relative: Docker action, only the workspace is mounted.
+          OUTPUT: CHANGELOG_BODY.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          tag_name: ${{ github.ref_name }}
+          body_path: ${{ steps.stamp.outputs.notes-file || 'CHANGELOG_BODY.md' }}
+          prerelease: ${{ needs.verify.outputs.prerelease }}
+          files: dist-release/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

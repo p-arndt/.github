@@ -1,0 +1,18 @@
+# .github/workflows/release.yml in p-arndt/minisuite
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  release:
+    uses: p-arndt/.github/.github/workflows/rust-release.yml@v1
+    permissions:
+      contents: write
+      packages: write
+    with:
+      name: minisuite
+      binaries: minicloak minimail minibucket minisuite
+      extra-files: README.md LICENSE minisuite.example.toml crates/minicloak/minicloak.example.toml
+      images: '["minicloak", "minimail", "minibucket", "minisuite"]'

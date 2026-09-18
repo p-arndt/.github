@@ -1,0 +1,20 @@
+# .github/workflows/release.yml in p-arndt/stamp
+# 'v*.*.*' rather than 'v*': the moved major tag (v0) must not start a run.
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+jobs:
+  release:
+    uses: p-arndt/.github/.github/workflows/go-release.yml@v1
+    permissions:
+      contents: write
+    with:
+      binary: stamp
+      test-os: '["ubuntu-latest", "macos-latest", "windows-latest"]'
+      configure-git: true
+      move-major-tag: true
+    secrets:
+      major-tag-token: ${{ secrets.MAJOR_TAG_TOKEN }}

@@ -1,0 +1,458 @@
+name: Go release
+
+# Reusable release pipeline for Go binaries, driven by a tag push only. The
+# version is decided before the tag exists (by `stamp release` or a release
+# script that writes VERSION); this pipeline is a worker, not a controller:
+#
+#   verify  -> the tag agrees with the committed version (stamp verify)
+#   test    -> vet + test on the tagged commit
+#   build   -> static CGO_ENABLED=0 cross-compile of every target on one
+#              ubuntu runner, archives or raw binaries, sha256 checksums,
+#              optional signing of the checksums file
+#   release -> GitHub Release with notes from the annotated tag (stamp) or
+#              git-cliff
+#   major-tag (optional) -> move vN onto this release
+#
+# Third-party actions are pinned to full commit SHAs, not tags: the release job
+# runs with `contents: write`, and a repointed tag on any action here could
+# replace the published binaries with something users install unquestioningly.
+
+on:
+  workflow_call:
+    inputs:
+      binary:
+        description: Binary name. Used for the executable and all asset names.
+        type: string
+        required: true
+      main:
+        description: Main package to build, e.g. "." or "./cmd/shenv".
+        type: string
+        default: .
+      targets:
+        description: >-
+          JSON array of GOOS/GOARCH targets. Explicit rather than a cross
+          product: darwin has no 386/arm port and windows/arm is gone since
+          Go 1.24.
+        type: string
+        default: '["linux/amd64", "linux/arm64", "darwin/amd64", "darwin/arm64", "windows/amd64", "windows/arm64"]'
+      artifact-style:
+        description: >-
+          "archive": <binary>_<version>_<os>_<arch>.tar.gz (.zip on windows).
+          "raw": bare binaries named <binary>-<os>-<arch>(.exe).
+        type: string
+        default: archive
+      archive-extra-files:
+        description: Space-separated files copied into every archive next to the binary (e.g. "README.md LICENSE").
+        type: string
+        default: ''
+      ldflags:
+        description: >-
+          -ldflags template. Placeholders: {module} (from `go list -m`),
+          {version} (tag without "v"), {commit} (short SHA), {date} (UTC RFC 3339).
+        type: string
+        default: '-s -w -X {module}/internal/buildinfo.Version={version} -X {module}/internal/buildinfo.Commit={commit} -X {module}/internal/buildinfo.Date={date}'
+      go-version-file:
+        description: Path to the file setup-go reads the Go version from.
+        type: string
+        default: go.mod
+      test:
+        description: Run vet + test before building.
+        type: boolean
+        default: true
+      test-os:
+        description: JSON array of runner labels the pre-release tests run on.
+        type: string
+        default: '["ubuntu-latest"]'
+      race:
+        description: Run the pre-release tests with -race.
+        type: boolean
+        default: false
+      configure-git:
+        description: Give git a throwaway identity on the test runners, for suites that create commits.
+        type: boolean
+        default: false
+      verify-tag:
+        description: Check the tag against the committed version with the stamp action.
+        type: boolean
+        default: true
+      changelog:
+        description: 'Release notes source: "stamp" (annotated tag message) or "git-cliff".'
+        type: string
+        default: stamp
+      cliff-config:
+        description: git-cliff config path (changelog = git-cliff only).
+        type: string
+        default: cliff.toml
+      sign:
+        description: Run sign-command after the checksums file is written.
+        type: boolean
+        default: false
+      sign-command:
+        description: >-
+          Shell command that signs the checksums file. Gets $CHECKSUMS (path),
+          $VERSION and the signing-key secret as $RELEASE_SIGNING_KEY. Any
+          file it writes into dist/ is published.
+        type: string
+        default: ''
+      move-major-tag:
+        description: >-
+          After a non-prerelease, force-move v<major> onto the release. Needs
+          the major-tag-token secret, and the caller must trigger on
+          'v*.*.*' so the moved tag does not start another run.
+        type: boolean
+        default: false
+    secrets:
+      signing-key:
+        description: Exposed to sign-command as $RELEASE_SIGNING_KEY.
+        required: false
+      major-tag-token:
+        description: Fine-grained token with Contents + Workflows read/write, for move-major-tag.
+        required: false
+    outputs:
+      version:
+        description: The released version, without a leading "v".
+        value: ${{ jobs.verify.outputs.version }}
+
+permissions:
+  contents: read
+
+# Two release runs uploading assets to the same tag would race; queue them
+# instead. Never cancel: a half-cancelled release could leave partial assets.
+concurrency:
+  group: go-release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.version.outputs.prerelease }}
+
+    steps:
+      - name: Require a tag push
+        if: github.ref_type != 'tag'
+        run: |
+          echo "::error::this workflow publishes the pushed tag; it was triggered by a ${GITHUB_REF_TYPE:-non-tag} ref" >&2
+          exit 1
+
+      - name: Check inputs
+        shell: bash
+        env:
+          STYLE: ${{ inputs.artifact-style }}
+          CHANGELOG: ${{ inputs.changelog }}
+          SIGN: ${{ inputs.sign }}
+          SIGN_COMMAND: ${{ inputs.sign-command }}
+        run: |
+          set -euo pipefail
+          case "$STYLE" in archive|raw) ;; *) echo "::error::artifact-style must be archive or raw, got '$STYLE'" >&2; exit 1 ;; esac
+          case "$CHANGELOG" in stamp|git-cliff) ;; *) echo "::error::changelog must be stamp or git-cliff, got '$CHANGELOG'" >&2; exit 1 ;; esac
+          if [ "$SIGN" = "true" ] && [ -z "$SIGN_COMMAND" ]; then
+            echo "::error::sign is true but sign-command is empty" >&2
+            exit 1
+          fi
+
+      - name: Checkout
+        if: inputs.verify-tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # `stamp verify` renders the tag from the committed version and compares,
+      # rather than trusting whatever was pushed.
+      - name: Verify the tag against the committed version
+        if: inputs.verify-tag
+        uses: p-arndt/stamp@97cdab09cbe2846f516f74b09a71034c09addce0 # v0.4.1
+
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          # Digits-first, semver charset, bounded length: the version is spliced
+          # into asset file names, so reject anything that isn't a plain version.
+          if ! [[ "$version" =~ ^[0-9][0-9A-Za-z.+-]{0,63}$ ]]; then
+            echo "::error::version '$version' is not a valid release version" >&2
+            exit 1
+          fi
+          # Semver pre-release tags (v0.5.0-beta.1) are flagged automatically.
+          if [[ "$version" == *-* ]]; then prerelease=true; else prerelease=false; fi
+          echo "version=$version"       >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+
+  # Nothing gets built or published from a commit that fails vet + tests.
+  test:
+    needs: verify
+    if: inputs.test
+    strategy:
+      fail-fast: true
+      matrix:
+        os: ${{ fromJSON(inputs.test-os) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: ${{ inputs.go-version-file }}
+          cache: true
+
+      - name: Configure git
+        if: inputs.configure-git
+        shell: bash
+        run: |
+          git config --global user.email "ci@example.com"
+          git config --global user.name "CI"
+          git config --global init.defaultBranch main
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        shell: bash
+        env:
+          RACE: ${{ inputs.race }}
+        run: |
+          set -euo pipefail
+          if [ "$RACE" = "true" ]; then go test -race ./...; else go test ./...; fi
+
+  # CGO_ENABLED=0 links no libc, so every target is fully static and all of
+  # them cross-compile from this one runner: no per-OS matrix, no drift.
+  build:
+    needs: [verify, test]
+    if: always() && needs.verify.result == 'success' && (needs.test.result == 'success' || needs.test.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: ${{ inputs.go-version-file }}
+          cache: true
+
+      # Inputs reach the script through env, never through ${{ }} inside the
+      # script body: interpolated input is how script injection happens.
+      - name: Build static binaries
+        shell: bash
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          BINARY: ${{ inputs.binary }}
+          MAIN: ${{ inputs.main }}
+          TARGETS: ${{ inputs.targets }}
+          STYLE: ${{ inputs.artifact-style }}
+          EXTRA_FILES: ${{ inputs.archive-extra-files }}
+          LDFLAGS_TEMPLATE: ${{ inputs.ldflags }}
+        run: |
+          set -euo pipefail
+
+          module="$(go list -m | head -n1)"
+          commit="$(git rev-parse --short HEAD)"
+          date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          ldflags="$LDFLAGS_TEMPLATE"
+          ldflags="${ldflags//\{module\}/$module}"
+          ldflags="${ldflags//\{version\}/$VERSION}"
+          ldflags="${ldflags//\{commit\}/$commit}"
+          ldflags="${ldflags//\{date\}/$date}"
+          echo "ldflags: $ldflags"
+
+          read -r -a extra <<< "$EXTRA_FILES" || true
+
+          mkdir -p dist
+          export CGO_ENABLED=0
+          for target in $(jq -r '.[]' <<< "$TARGETS"); do
+            if ! [[ "$target" =~ ^[a-z0-9]+/[a-z0-9]+$ ]]; then
+              echo "::error::target '$target' is not GOOS/GOARCH" >&2
+              exit 1
+            fi
+            export GOOS="${target%/*}" GOARCH="${target#*/}"
+            echo "-> building $GOOS/$GOARCH"
+
+            if [ "$STYLE" = "raw" ]; then
+              out="dist/${BINARY}-${GOOS}-${GOARCH}"
+              [ "$GOOS" = windows ] && out="${out}.exe"
+              go build -trimpath -ldflags "$ldflags" -o "$out" "$MAIN"
+              continue
+            fi
+
+            rm -rf stage && mkdir -p stage
+            bin="$BINARY"
+            [ "$GOOS" = windows ] && bin="${BINARY}.exe"
+            go build -trimpath -ldflags "$ldflags" -o "stage/$bin" "$MAIN"
+            for f in ${extra[@]+"${extra[@]}"}; do cp "$f" stage/; done
+
+            # zip on Windows, tar.gz elsewhere: the tarball keeps the exec bit,
+            # which a zip would drop and leave users chmod-ing by hand.
+            name="${BINARY}_${VERSION}_${GOOS}_${GOARCH}"
+            # Named entries, not ".": an archive of "./hop" would break
+            # `tar -xzf <archive> hop` in install scripts.
+            files=()
+            while IFS= read -r f; do files+=("$f"); done < <(cd stage && ls -A)
+            if [ "$GOOS" = windows ]; then
+              (cd stage && zip -q -r "../dist/$name.zip" "${files[@]}")
+            else
+              tar -czf "dist/$name.tar.gz" -C stage "${files[@]}"
+            fi
+          done
+          rm -rf stage
+
+          # The glob expands before the checksums file exists, so it never
+          # lists itself.
+          checksums="${BINARY}_${VERSION}_checksums.txt"
+          (cd dist && sha256sum -- * > "$checksums")
+          echo "CHECKSUMS=dist/$checksums" >> "$GITHUB_ENV"
+          ls -l dist
+
+      # A signing tool that fails must fail the release: publishing unsigned
+      # assets would strand every updater that insists on a signature.
+      - name: Sign checksums
+        if: inputs.sign
+        shell: bash
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          SIGN_COMMAND: ${{ inputs.sign-command }}
+          RELEASE_SIGNING_KEY: ${{ secrets.signing-key }}
+        run: |
+          set -euo pipefail
+          if [ -z "$RELEASE_SIGNING_KEY" ]; then
+            echo "::error::sign is true but the signing-key secret is empty" >&2
+            exit 1
+          fi
+          eval "$SIGN_COMMAND"
+          ls -l dist
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  # Publishing is download-and-upload only. ubuntu also because git-cliff-action
+  # is a Docker action, which only runs on Linux runners.
+  release:
+    needs: [verify, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # git-cliff walks the history since the previous tag; stamp reads the
+          # annotated tag object.
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist
+
+      # `stamp release` renders the changelog section into the annotated tag
+      # message; the action reads it back. Nothing is generated.
+      - name: Read release notes from the tag
+        id: stamp
+        if: inputs.changelog == 'stamp'
+        uses: p-arndt/stamp@97cdab09cbe2846f516f74b09a71034c09addce0 # v0.4.1
+
+      - name: Generate changelog
+        if: inputs.changelog == 'git-cliff'
+        uses: orhun/git-cliff-action@f50e11560dce63f7c33227798f90b924471a88b5 # v4.8.0
+        with:
+          config: ${{ inputs.cliff-config }}
+          args: --latest --strip all
+        env:
+          # Relative: this is a Docker action, and only the workspace is
+          # mounted into its container.
+          OUTPUT: CHANGELOG_BODY.md
+
+      - name: Assemble release notes
+        shell: bash
+        env:
+          PRERELEASE: ${{ needs.verify.outputs.prerelease }}
+          NOTES_FILE: ${{ steps.stamp.outputs.notes-file || 'CHANGELOG_BODY.md' }}
+        run: |
+          set -euo pipefail
+          notes="$RUNNER_TEMP/release-notes.md"
+          if [ "$PRERELEASE" = "true" ]; then
+            echo "## 🧪 Pre-release $GITHUB_REF_NAME" > "$notes"
+          else
+            echo "## 🚀 Release $GITHUB_REF_NAME" > "$notes"
+          fi
+          echo "" >> "$notes"
+          cat "$NOTES_FILE" >> "$notes"
+          echo "NOTES=$notes" >> "$GITHUB_ENV"
+          cat "$notes"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        with:
+          tag_name: ${{ github.ref_name }}
+          body_path: ${{ env.NOTES }}
+          prerelease: ${{ needs.verify.outputs.prerelease }}
+          files: |
+            dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Moved last, so v<major> only ever names a version that fully published.
+  # Pre-releases are skipped: `@vN` means "the current N.x", and a beta is not.
+  major-tag:
+    needs: [verify, release]
+    if: inputs.move-major-tag && needs.verify.outputs.prerelease == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    # GITHUB_TOKEN cannot push a ref whose move changes a file under
+    # .github/workflows, so the tag is pushed with a dedicated token.
+    steps:
+      - name: Require the major tag token
+        shell: bash
+        env:
+          MAJOR_TAG_TOKEN: ${{ secrets.major-tag-token }}
+        run: |
+          if [ -z "$MAJOR_TAG_TOKEN" ]; then
+            echo "::error::secret major-tag-token is not set: pass a fine-grained token with Contents and Workflows read and write" >&2
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          token: ${{ secrets.major-tag-token }}
+
+      - name: Move the major tag onto this release
+        shell: bash
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          major="v${VERSION%%.*}"
+          echo "moving $major onto $GITHUB_REF_NAME ($GITHUB_SHA)"
+          # An annotated tag needs an identity; naming the bot is honest about
+          # what moved it.
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git tag -f -a "$major" -m "$GITHUB_REPOSITORY $GITHUB_REF_NAME" "$GITHUB_SHA"
+          git push --force origin "refs/tags/$major"
+          echo "$major -> $GITHUB_REF_NAME" >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,113 @@
+name: Rust CI
+
+# Reusable CI for Cargo projects: lockfile freshness, rustfmt, clippy with
+# -D warnings and tests on an OS matrix.
+#
+# The toolchain is installed with the runner's preinstalled rustup rather than
+# a third-party action: one less action to pin and trust.
+
+on:
+  workflow_call:
+    inputs:
+      os:
+        description: JSON array of runner labels for the matrix.
+        type: string
+        default: '["ubuntu-latest", "macos-latest", "windows-latest"]'
+      toolchain:
+        description: Rust toolchain to install (stable, beta, nightly or a version like 1.90.0).
+        type: string
+        default: stable
+      locked:
+        description: Fail if Cargo.lock is out of date with Cargo.toml.
+        type: boolean
+        default: true
+      fmt:
+        description: Run `cargo fmt --all --check` (ubuntu leg only).
+        type: boolean
+        default: true
+      clippy:
+        description: Run clippy with -D warnings.
+        type: boolean
+        default: true
+      clippy-args:
+        description: Arguments passed to `cargo clippy` before `-- -D warnings`.
+        type: string
+        default: --workspace --all-targets
+      test:
+        description: Run `cargo test`.
+        type: boolean
+        default: true
+      test-args:
+        description: Arguments passed to `cargo test`.
+        type: string
+        default: --workspace
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rust-ci-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: fmt + clippy + test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(inputs.os) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install toolchain
+        shell: bash
+        env:
+          TOOLCHAIN: ${{ inputs.toolchain }}
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$TOOLCHAIN" --profile minimal --component rustfmt,clippy --no-self-update
+          rustup default "$TOOLCHAIN"
+          rustc --version
+
+      - name: Cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # --locked fails if Cargo.lock drifted from Cargo.toml, which would
+      # otherwise only surface at release time.
+      - name: Cargo.lock is up to date
+        if: inputs.locked
+        shell: bash
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
+      # Formatting is platform independent, so one leg is enough.
+      - name: Format
+        if: inputs.fmt && runner.os == 'Linux'
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        if: inputs.clippy
+        shell: bash
+        env:
+          ARGS: ${{ inputs.clippy-args }}
+        run: |
+          # shellcheck disable=SC2086 # ARGS is a list of flags on purpose
+          cargo clippy $ARGS -- -D warnings
+
+      - name: Test
+        if: inputs.test
+        shell: bash
+        env:
+          ARGS: ${{ inputs.test-args }}
+        run: |
+          # shellcheck disable=SC2086 # ARGS is a list of flags on purpose
+          cargo test $ARGS

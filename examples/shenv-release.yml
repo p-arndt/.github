@@ -1,0 +1,24 @@
+# .github/workflows/release.yml in p-arndt/shenv
+# ed25519-signed checksums: `shenv update` refuses unsigned releases.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  release:
+    uses: p-arndt/.github/.github/workflows/go-release.yml@v1
+    permissions:
+      contents: write
+    with:
+      binary: shenv
+      main: ./cmd/shenv
+      archive-extra-files: README.md
+      changelog: git-cliff
+      sign: true
+      sign-command: >-
+        go run ./cmd/release-sign sign "$CHECKSUMS" &&
+        go run ./cmd/release-sign selfcheck "$CHECKSUMS"
+    secrets:
+      signing-key: ${{ secrets.RELEASE_SIGNING_KEY }}

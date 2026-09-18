@@ -1,0 +1,25 @@
+# .github/workflows/ci.yml in p-arndt/uprox
+# The e2e job (Postgres service + Playwright) stays local.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    uses: p-arndt/.github/.github/workflows/sveltekit-ci.yml@v1
+    with:
+      build: true
+      env: |
+        POSTGRES_HOST=ci
+        POSTGRES_USER=ci
+        POSTGRES_PASSWORD=ci
+        POSTGRES_DB=ci
+        BETTER_AUTH_SECRET=ci-placeholder-secret-not-used-at-runtime
+        ORIGIN=http://localhost
