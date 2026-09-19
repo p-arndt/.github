@@ -73,7 +73,7 @@ Output: `version`.
 | `name` | string | **required** | archive prefix: `<name>-<ver>-<target>.tar.gz`/`.zip` |
 | `binaries` | string | **required** | space-separated binaries packed into every archive |
 | `targets` | string (JSON) | x86_64/aarch64 linux-musl, x86_64 windows-msvc, aarch64/x86_64 apple-darwin | `[{"os": ..., "target": ...}]` |
-| `extra-files` | string | `README.md LICENSE` | added when present (globs allowed) |
+| `extra-files` | string | `README.md LICENSE` | added when present (globs allowed); `src=dest` stores a file under another name |
 | `cargo-args` | string | `--workspace --locked` | |
 | `toolchain` | string | `stable` | |
 | `verify-tag` | boolean | `true` | stamp verify |

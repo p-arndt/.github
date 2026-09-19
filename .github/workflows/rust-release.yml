@@ -35,7 +35,10 @@ on:
             {"os": "macos-latest",   "target": "x86_64-apple-darwin"}
           ]
       extra-files:
-        description: Space-separated files added to every archive when they exist (missing ones are skipped).
+        description: >-
+          Space-separated files added to every archive when they exist (missing ones
+          are skipped). Write `src=dest` to store a file under another name, e.g.
+          `crates/minimail/creds.example=minimail.creds.example`.
         type: string
         default: README.md LICENSE
       cargo-args:
@@ -197,7 +200,10 @@ jobs:
           dir="${NAME}-${VERSION}-${TARGET}"
           mkdir -p "dist/$dir"
           for bin in $BINARIES; do cp "target/${TARGET}/release/$bin" "dist/$dir/"; done
-          for f in $EXTRA_FILES; do [ -f "$f" ] && cp "$f" "dist/$dir/" || true; done
+          for f in $EXTRA_FILES; do
+            src="${f%%=*}"; dest="$(basename "${f#*=}")"
+            [ -f "$src" ] && cp "$src" "dist/$dir/$dest" || true
+          done
           tar -C dist -czf "dist/${dir}.tar.gz" "$dir"
           ls -l dist
 
@@ -218,7 +224,9 @@ jobs:
             Copy-Item "target/$env:TARGET/release/$bin.exe" "dist/$dir/"
           }
           foreach ($f in ($env:EXTRA_FILES -split '\s+' | Where-Object { $_ })) {
-            if (Test-Path $f) { Copy-Item $f "dist/$dir/" }
+            $src, $dest = $f -split '=', 2
+            if (-not $dest) { $dest = Split-Path $src -Leaf } else { $dest = Split-Path $dest -Leaf }
+            if (Test-Path $src) { Copy-Item $src "dist/$dir/$dest" }
           }
           Compress-Archive -Path "dist/$dir/*" -DestinationPath "dist/$dir.zip" -Force
           Get-ChildItem dist
