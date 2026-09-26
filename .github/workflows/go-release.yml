@@ -163,7 +163,7 @@ jobs:
       # rather than trusting whatever was pushed.
       - name: Verify the tag against the committed version
         if: inputs.verify-tag
-        uses: p-arndt/stamp@97cdab09cbe2846f516f74b09a71034c09addce0 # v0.4.1
+        uses: p-arndt/stamp@f4b7acfb14f4ebe4b592b60d13b90c954474df7e # v0.5.0
 
       - name: Resolve version
         id: version
@@ -371,7 +371,7 @@ jobs:
       - name: Read release notes from the tag
         id: stamp
         if: inputs.changelog == 'stamp'
-        uses: p-arndt/stamp@97cdab09cbe2846f516f74b09a71034c09addce0 # v0.4.1
+        uses: p-arndt/stamp@f4b7acfb14f4ebe4b592b60d13b90c954474df7e # v0.5.0
 
       - name: Generate changelog
         if: inputs.changelog == 'git-cliff'
