@@ -386,8 +386,10 @@ jobs:
 
   # Publishing is download-and-upload only. ubuntu also because git-cliff-action
   # is a Docker action, which only runs on Linux runners.
+  # always(): a skipped test job (test: false) would otherwise skip this job too.
   release:
     needs: [verify, build]
+    if: always() && needs.verify.result == 'success' && needs.build.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -459,7 +461,7 @@ jobs:
   # Pre-releases are skipped: `@vN` means "the current N.x", and a beta is not.
   major-tag:
     needs: [verify, release]
-    if: inputs.move-major-tag && needs.verify.outputs.prerelease == 'false'
+    if: always() && needs.release.result == 'success' && inputs.move-major-tag && needs.verify.outputs.prerelease == 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
