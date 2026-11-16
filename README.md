@@ -39,6 +39,9 @@ commit SHA with a `# vX.Y.Z` comment; every job declares minimal `permissions:`.
 | `archive-extra-files` | string | `''` | space-separated files added to each archive |
 | `ldflags` | string | `-s -w -X {module}/internal/buildinfo.Version={version} ...Commit={commit} ...Date={date}` | placeholders `{module}` `{version}` `{commit}` `{date}` |
 | `go-version-file` | string | `go.mod` | |
+| `pnpm-directory` | string | `''` | set up pnpm (from `packageManager`) and Node.js for `before-build` |
+| `node-version` | string | `24` | only with `pnpm-directory` |
+| `before-build` | string | `''` | command run before the Go build, e.g. building an embedded web UI |
 | `test` | boolean | `true` | vet + test before building |
 | `test-os` | string (JSON) | `["ubuntu-latest"]` | runners for those tests |
 | `race` | boolean | `false` | `-race` for those tests |
